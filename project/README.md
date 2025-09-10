@@ -13,6 +13,8 @@ Application web (Vite + React + TypeScript + Tailwind) pour visualisation, annot
 npm install      # installer les dépendances
 npm run dev      # lancer le serveur de dev
 npm run build    # build de production
+npm run test     # exécuter les tests (Vitest)
+npm run test:ui  # mode watch/UI
 npm run preview  # prévisualiser le build
 ```
 
@@ -39,7 +41,10 @@ project/
 - Types TS: `tsconfig*.json`
 
 ## Qualité / Lint
-ESLint et config TypeScript déjà inclus. (Ajouter `npm run lint` si nécessaire.)
+ESLint, Vitest et Testing Library configurés.
+- Lint: `npm run lint`
+- Tests: `npm run test`
+- CI: workflow GitHub Actions `.github/workflows/ci.yml`
 
 ## Roadmap (suggestions)
 - Auth réelle (API)
