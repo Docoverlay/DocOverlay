@@ -18,6 +18,7 @@ npm run dev      # lancer le serveur de dev
 npm run build    # build de production
 npm run test     # exécuter les tests (Vitest)
 npm run test:ui  # mode watch/UI
+npm run format   # formatage Prettier
 npm run preview  # prévisualiser le build
 ```
 
@@ -64,6 +65,24 @@ Un rapport texte s’affiche et `coverage/lcov-report/index.html` peut être ouv
 
 ## Licence
 Projet sous licence MIT (voir `LICENSE`).
+
+## Contribution / Qualité
+- Husky pré-commit: exécute lint-staged (Prettier + ESLint sur fichiers modifiés)
+- Lint-staged: défini dans `.lintstagedrc.json`
+- Formatage: Prettier (`.prettierrc`)
+- TS stricte renforcée (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `noImplicitOverride`)
+
+## Workflow recommandé (dev expérimenté)
+1. Créer branche feature: `git checkout -b feat/ma-fonctionnalite`
+2. Développer + tests (`npm run test:ui`)
+3. Lint & format auto via pre-commit
+4. Push → CI (build + lint + tests) valide
+5. Pull Request avec description claire
+
+## Badges (à ajouter après premier run CI)
+```
+![CI](https://github.com/Docoverlay/DocOverlay/actions/workflows/ci.yml/badge.svg)
+```
 
 ---
 Commit de clean start: un seul commit sur `main`.
