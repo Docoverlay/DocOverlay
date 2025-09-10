@@ -1,5 +1,8 @@
 # DocOverlay
 
+> Statut CI: (ajouter le badge après premier run)  
+> Couverture: générée via `npm run test` (rapport lcov)
+
 Application web (Vite + React + TypeScript + Tailwind) pour visualisation, annotation et gestion documentaire orientée dossiers patients.
 
 ## Stack
@@ -46,6 +49,13 @@ ESLint, Vitest et Testing Library configurés.
 - Tests: `npm run test`
 - CI: workflow GitHub Actions `.github/workflows/ci.yml`
 
+### Couverture
+Après exécution :
+```
+npm run test
+```
+Un rapport texte s’affiche et `coverage/lcov-report/index.html` peut être ouvert dans un navigateur.
+
 ## Roadmap (suggestions)
 - Auth réelle (API)
 - Tests unitaires (Vitest / React Testing Library)
@@ -53,7 +63,7 @@ ESLint, Vitest et Testing Library configurés.
 - Déploiement (Netlify / Vercel)
 
 ## Licence
-Choisir une licence (MIT recommandé) et ajouter un fichier `LICENSE`.
+Projet sous licence MIT (voir `LICENSE`).
 
 ---
 Commit de clean start: un seul commit sur `main`.
