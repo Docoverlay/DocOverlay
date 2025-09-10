@@ -8,6 +8,7 @@ export interface Zone {
   locked: boolean;
   checked: boolean;
   prestataire?: string; // Prestataire spécifique à cette zone (saisi lors de l'encodage)
+  isBarcode?: boolean; // Indique que la zone est dédiée à la lecture d'un code-barres (Scan2Overlay)
 }
 
 export interface ExportData {

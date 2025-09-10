@@ -1,5 +1,5 @@
 import React from 'react';
-import { Plus, Upload, Save, Trash2, Zap, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Plus, Upload, Save, Trash2, Zap, ChevronLeft, ChevronRight, Download } from 'lucide-react';
 import type { Zone, DocType, ConvertedDocument } from '../types';
 
 interface ToolbarProps {
@@ -21,7 +21,7 @@ interface ToolbarProps {
   autoDetectionMode: boolean;
   setAutoDetectionMode: (v: boolean) => void;
 
-  isProcessing: boolean;
+  isProcessing?: boolean; // deprecated
 
   bgSrc: string | null;
   convertedDocument: ConvertedDocument | null;
@@ -32,6 +32,8 @@ interface ToolbarProps {
   onPageSelect: (pageIndex: number) => void;
 
   onClearDocument: () => void;
+  onExportJSON?: () => void;
+  onAddBarcodeZone?: () => void;
 }
 
 export default function Toolbar(props: ToolbarProps) {
@@ -39,13 +41,15 @@ export default function Toolbar(props: ToolbarProps) {
     documentName, setDocumentName,
     docType, setDocType,
     providerCode, setProviderCode,
-    zones,
+    zones: _zones,
     onAddZone, onSaveDocument, onUpload,
     autoDetectionMode, setAutoDetectionMode,
     isProcessing,
-    bgSrc, convertedDocument, isConverting, conversionProgress,
-    onPageNavigation, onPageSelect,
-    onClearDocument
+    bgSrc: _bgSrc, convertedDocument, isConverting: _isConverting, conversionProgress: _conversionProgress,
+    onPageNavigation, onPageSelect: _onPageSelect,
+  onClearDocument,
+  onExportJSON,
+  onAddBarcodeZone
   } = props;
 
   const totalPages = convertedDocument?.totalPages ?? 0;
@@ -128,6 +132,18 @@ export default function Toolbar(props: ToolbarProps) {
           Ajouter case
         </button>
 
+        {onAddBarcodeZone && (
+          <button
+            type="button"
+            onClick={onAddBarcodeZone}
+            className="inline-flex items-center justify-center gap-2 rounded-md bg-yellow-400 text-black px-3 py-2 text-sm hover:bg-yellow-500"
+            title="Ajouter une zone dédiée à la lecture d'un code-barres"
+          >
+            <Plus className="w-4 h-4" />
+            Zone code-barres
+          </button>
+        )}
+
         {/* Détection auto (toggle) */}
         <button
           type="button"
@@ -149,6 +165,18 @@ export default function Toolbar(props: ToolbarProps) {
           <Save className="w-4 h-4" />
           Sauvegarder
         </button>
+
+        {/* Export JSON (optionnel) */}
+        {onExportJSON && (
+          <button
+            type="button"
+            onClick={onExportJSON}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 col-span-2"
+          >
+            <Download className="w-4 h-4" />
+            Exporter JSON
+          </button>
+        )}
 
         {/* Effacer document */}
         <button

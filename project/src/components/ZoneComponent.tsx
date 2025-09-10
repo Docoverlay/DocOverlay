@@ -1,5 +1,6 @@
 import React from 'react';
 import { Zone } from '../types';
+import { Barcode } from 'lucide-react';
 
 interface ZoneComponentProps {
   zone: Zone;
@@ -8,6 +9,7 @@ interface ZoneComponentProps {
   onMouseDown: (e: React.MouseEvent, zone: Zone) => void;
   onContextMenu: (e: React.MouseEvent, zone: Zone) => void;
   onResizeStart: (e: React.MouseEvent, zone: Zone, direction: string) => void;
+  className?: string;
 }
 
 export default function ZoneComponent({
@@ -16,9 +18,11 @@ export default function ZoneComponent({
   zoomLevel = 1,
   onMouseDown,
   onContextMenu,
-  onResizeStart
+  onResizeStart,
+  className = ''
 }: ZoneComponentProps) {
   const getZoneColor = (z: Zone) => {
+  if (z.isBarcode) return 'bg-yellow-200 border-yellow-500 border-dashed';
     if (z.locked && z.code) return 'bg-green-300 border-green-500';
     if (z.locked) return 'bg-orange-300 border-orange-500';
     if (z.code) return 'bg-blue-300 border-blue-500';
@@ -49,7 +53,7 @@ export default function ZoneComponent({
   return (
     <div
       data-zone-id={zone.id} // IMPORTANT pour l'update par transform côté onDragStart
-      className={`absolute select-none ${getZoneColor(zone)} border-2 ${zone.locked ? 'cursor-default' : 'cursor-move hover:shadow-md'}`}
+  className={`absolute select-none ${getZoneColor(zone)} border-2 ${zone.locked ? 'cursor-default' : 'cursor-move hover:shadow-md'} ${className}`}
       style={{
         top: px(zone.top),
         left: px(zone.left),
@@ -69,6 +73,12 @@ export default function ZoneComponent({
       onDragStart={handleDragStart}
       draggable={false}
     >
+      {zone.isBarcode && (
+        <div className="absolute top-0 left-0 m-0.5 px-1 py-0.5 bg-yellow-300/90 text-yellow-900 rounded text-[10px] font-medium flex items-center gap-0.5 pointer-events-none select-none">
+          <Barcode className="w-3 h-3" />
+          CB
+        </div>
+      )}
       {/* Code affiché au centre */}
       {zone.code && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Lock, Unlock, Trash2, Minus, Plus, Copy, Clipboard, Move } from 'lucide-react';
+import { Lock, Unlock, Trash2, Minus, Plus, Copy, Clipboard, Move, Barcode } from 'lucide-react';
 import { Zone } from '../types';
 
 interface ContextMenuProps {
@@ -254,7 +254,19 @@ export default function ContextMenu({
         </div>
 
         {/* Action Buttons */}
-        <div className="flex gap-2 pt-4 border-t">
+        <div className="flex flex-wrap gap-2 pt-4 border-t">
+          <button
+            onClick={() => onUpdateZone(zone.id, { isBarcode: !zone.isBarcode })}
+            className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+              zone.isBarcode
+                ? 'bg-yellow-200 text-yellow-800 hover:bg-yellow-300'
+                : 'bg-yellow-50 text-yellow-700 hover:bg-yellow-100'
+            }`}
+            title="Marquer ou dé-marquer cette zone comme zone de lecture code-barres"
+          >
+            <Barcode className="w-4 h-4" />
+            {zone.isBarcode ? 'Code-barres' : 'Marquer code-barres'}
+          </button>
           <button
             onClick={() => onUpdateZone(zone.id, { locked: !zone.locked })}
             className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${

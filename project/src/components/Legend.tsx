@@ -5,7 +5,8 @@ export default function Legend() {
     { color: 'bg-red-300', label: 'Déverrouillé + sans code' },
     { color: 'bg-blue-300', label: 'Déverrouillé + avec code' },
     { color: 'bg-orange-300', label: 'Verrouillé + sans code' },
-    { color: 'bg-green-300', label: 'Verrouillé + avec code' }
+    { color: 'bg-green-300', label: 'Verrouillé + avec code' },
+    { color: 'bg-yellow-200 border-dashed', label: 'Zone code-barres' }
   ];
 
   return (

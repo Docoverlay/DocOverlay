@@ -8,6 +8,14 @@ import Button from './ui/Button';
 import { User, SavedDocument, Patient } from '../types';
 import { convertDocumentToImages } from '../utils/documentConverter';
 import { getDocuments } from '../utils/database';
+import { clamp, rotateRectPct, computeTightRectPct, normalizeZonesAgainstRect, normAngle } from '../utils/geometry';
+import { useBarcodeReader } from '../hooks/useBarcodeReader';
+import { useAutoCheck } from '../hooks/useAutoCheck';
+import { InlineCalendar } from './InlineCalendar';
+import { ProgressBar } from './ProgressBar';
+import { useOverlayDrag } from '../hooks/useOverlayDrag';
+// With moduleResolution 'bundler', include explicit extension for local TS util
+import { detectContentRectFromUrl, loadImage } from '../utils/detectContentRect';
 
 /* =========================
    Types
@@ -18,6 +26,7 @@ type OverlayZone = {
   x: number; y: number; width: number; height: number; // en %
   page?: number;
   code?: string; label?: string;
+  isBarcode?: boolean; // zone spéciale pour lecture code-barres (séjour)
 };
 
 type SheetTemplate = {
@@ -46,8 +55,7 @@ type RectPct = { x: number; y: number; w: number; h: number };
    Constantes / Helpers
    ========================= */
 
-const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
-const AUTO_PAD_PCT = 1.8;
+// clamp now imported from geometry util
 
 const S2O_ACCENT_TEXT = 'text-pink-600';
 const S2O_ACCENT_BG = 'bg-pink-50';
@@ -57,7 +65,7 @@ const S2O_BADGE_TEXT = 'text-pink-800';
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const toYMD = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const parseYMD = (ymd: string) => { const [y,m,d] = ymd.split('-').map(Number); return new Date(y,(m||1)-1,d||1); };
+const parseYMD = (ymd: string) => { const [ys, ms, ds] = ymd.split('-'); const y = Number(ys) || new Date().getFullYear(); const m = Number(ms) || 1; const d = Number(ds) || 1; return new Date(y, m - 1, d); };
 const daysBetweenInclusive = (a: string, b: string): string[] => {
   let d1 = parseYMD(a), d2 = parseYMD(b); if (d1 > d2) [d1, d2] = [d2, d1];
   const out: string[] = []; const cur = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate());
@@ -65,206 +73,11 @@ const daysBetweenInclusive = (a: string, b: string): string[] => {
   return out;
 };
 
-const normAngle = (a: number) => ((a % 360) + 360) % 360;
-function rotateRectPct(r: RectPct, angleCW: number): RectPct {
-  const a = normAngle(angleCW);
-  if (a === 0) return { ...r };
-  if (a === 90)   return { x: 100 - (r.y + r.h), y: r.x,                   w: r.h, h: r.w };
-  if (a === 180)  return { x: 100 - (r.x + r.w), y: 100 - (r.y + r.h),    w: r.w, h: r.h };
-  return { x: r.y, y: 100 - (r.x + r.w), w: r.h, h: r.w }; // 270
-}
-function mapDisplayDeltaToModel(dxDisp: number, dyDisp: number, angleCW: number) {
-  const a = normAngle(angleCW);
-  if (a === 0)   return { dx: dxDisp, dy: dyDisp };
-  if (a === 90)  return { dx: dyDisp, dy: -dxDisp };
-  if (a === 180) return { dx: -dxDisp, dy: -dyDisp };
-  return { dx: -dyDisp, dy: dxDisp };
-}
-
-function computeTightRectPct(zs: OverlayZone[], pageRel: number): RectPct | null {
-  const arr = zs.filter(z => (z.page ?? 0) === pageRel);
-  if (!arr.length) return null;
-  const minX = Math.min(...arr.map(z => z.x));
-  const minY = Math.min(...arr.map(z => z.y));
-  const maxX = Math.max(...arr.map(z => z.x + z.width));
-  const maxY = Math.max(...arr.map(z => z.y + z.height));
-  const x = clamp(minX - AUTO_PAD_PCT, 0, 100);
-  const y = clamp(minY - AUTO_PAD_PCT, 0, 100);
-  const w = clamp(maxX - x + AUTO_PAD_PCT, 1, 100 - x);
-  const h = clamp(maxY - y + AUTO_PAD_PCT, 1, 100 - y);
-  return { x, y, w, h };
-}
-
-function normalizeZonesAgainstRect(zs: OverlayZone[], pageRel: number, rect: RectPct) {
-  const list = zs.filter(z => (z.page ?? 0) === pageRel);
-  return list.map(z => ({
-    ...z,
-    x: clamp(((z.x - rect.x) / rect.w) * 100, 0, 100),
-    y: clamp(((z.y - rect.y) / rect.h) * 100, 0, 100),
-    width: clamp((z.width / rect.w) * 100, 0.5, 100),
-    height: clamp((z.height / rect.h) * 100, 0.5, 100),
-  }));
-}
+// geometry helpers now imported (rotateRectPct, mapDisplayDeltaToModel, computeTightRectPct, normalizeZonesAgainstRect, normAngle)
 
 /* =========================
-   Auto-calage HQ (détection rectangle de contenu)
-   ========================= */
-
-/** charge une image */
-function loadImage(url: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const im = new Image();
-    im.crossOrigin = 'anonymous'; // au cas où (PDF.js/Blob/remote)
-    im.onload = () => resolve(im);
-    im.onerror = reject;
-    im.src = url;
-  });
-}
-
-/** Rectangle de contenu robuste (2 passes + lissage + raffinement local) */
-async function detectContentRectFromUrl(
-  url: string,
-  opts?: { maxDim?: number; marginPct?: number }
-): Promise<RectPct> {
-  // ---- Paramètres "HQ"
-  const COARSE_MAX = 900;                         // passe 1
-  const FINE_MAX   = opts?.maxDim ?? 1800;        // passe 2 (plus précis)
-  const MARGIN_PCT = opts?.marginPct ?? 0.012;    // ~1.2% d’énergie ignorée
-  const SMOOTH_FR  = 0.010;                       // lissage 1D (1% de la taille)
-  const SEARCH_FR  = 0.050;                       // raffinement ±5%
-  const BAND_FR    = 0.006;                       // bande pour scorer un bord (~0.6%)
-
-  const img = await loadImage(url);
-
-  function renderAndSums(maxDim: number) {
-    const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-    const W = Math.max(2, Math.round(img.width * scale));
-    const H = Math.max(2, Math.round(img.height * scale));
-    const canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d')!;
-    ctx.drawImage(img, 0, 0, W, H);
-    const { data } = ctx.getImageData(0, 0, W, H);
-
-    const rowSum = new Float64Array(H);
-    const colSum = new Float64Array(W);
-
-    // gradient magnitude (rapide)
-    const idx = (x: number, y: number) => (y * W + x) * 4;
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const i = idx(x, y);
-        const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        const rx = x < W - 1 ? idx(x + 1, y) : i;
-        const ry = y < H - 1 ? idx(x, y + 1) : i;
-        const gx = 0.299 * data[rx] + 0.587 * data[rx + 1] + 0.114 * data[rx + 2];
-        const gy = 0.299 * data[ry] + 0.587 * data[ry + 1] + 0.114 * data[ry + 2];
-        const mag = Math.abs(g - gx) + Math.abs(g - gy);
-        rowSum[y] += mag;
-        colSum[x] += mag;
-      }
-    }
-
-    // lissage (moyenne glissante + symétrie simple)
-    const smooth1D = (src: Float64Array, winFrac: number) => {
-      const n = src.length;
-      const w = Math.max(1, Math.floor(n * winFrac));
-      const out = new Float64Array(n);
-      let acc = 0;
-      for (let i = 0; i < n; i++) {
-        acc += src[i];
-        if (i >= w) acc -= src[i - w];
-        out[i] = acc / Math.min(i + 1, w);
-      }
-      for (let i = n - 2; i >= 0; i--) out[i] = (out[i] + out[i + 1]) * 0.5;
-      return out;
-    };
-
-    const rS = smooth1D(rowSum, SMOOTH_FR);
-    const cS = smooth1D(colSum, SMOOTH_FR);
-    return { W, H, rowSum: rS, colSum: cS };
-  }
-
-  function initialCuts(sum: Float64Array, marginPct: number) {
-    const total = sum.reduce((a, b) => a + b, 0);
-    const cut = total * marginPct;
-    let lo = 0, hi = sum.length - 1, acc = 0;
-    for (let i = 0; i < sum.length; i++) { acc += sum[i]; if (acc >= cut) { lo = i; break; } }
-    acc = 0;
-    for (let i = sum.length - 1; i >= 0; i--) { acc += sum[i]; if (acc >= cut) { hi = i; break; } }
-    return { lo, hi };
-  }
-
-  function refineEdge(sum: Float64Array, guess: number, searchRadius: number, band: number) {
-    const n = sum.length;
-    const a0 = Math.max(0, Math.floor(guess - searchRadius));
-    const a1 = Math.min(n - 1, Math.ceil(guess + searchRadius));
-    let best = guess, bestScore = -Infinity;
-    for (let i = a0; i <= a1; i++) {
-      const b0 = Math.max(0, i - band);
-      const b1 = Math.min(n - 1, i + band);
-      let s = 0;
-      for (let k = b0; k <= b1; k++) s += sum[k];
-      if (s > bestScore) { bestScore = s; best = i; }
-    }
-    return best;
-  }
-
-  // --- PASS 1 (coarse)
-  const c = renderAndSums(COARSE_MAX);
-  const cutYc = initialCuts(c.rowSum, MARGIN_PCT);
-  const cutXc = initialCuts(c.colSum, MARGIN_PCT);
-
-  const searchYc = Math.max(6, Math.floor(c.H * SEARCH_FR));
-  const searchXc = Math.max(6, Math.floor(c.W * SEARCH_FR));
-  const bandYc   = Math.max(2, Math.floor(c.H * BAND_FR));
-  const bandXc   = Math.max(2, Math.floor(c.W * BAND_FR));
-
-  let top_c    = refineEdge(c.rowSum, cutYc.lo, searchYc, bandYc);
-  let bottom_c = refineEdge(c.rowSum, cutYc.hi, searchYc, bandYc);
-  let left_c   = refineEdge(c.colSum, cutXc.lo, searchXc, bandXc);
-  let right_c  = refineEdge(c.colSum, cutXc.hi, searchXc, bandXc);
-
-  top_c    = clamp(top_c, 0, c.H - 2);
-  bottom_c = clamp(bottom_c, top_c + 1, c.H - 1);
-  left_c   = clamp(left_c, 0, c.W - 2);
-  right_c  = clamp(right_c, left_c + 1, c.W - 1);
-
-  // --- PASS 2 (fine)
-  const f = renderAndSums(FINE_MAX);
-  const scaleY = f.H / c.H;
-  const scaleX = f.W / c.W;
-
-  const top0    = Math.round(top_c * scaleY);
-  const bottom0 = Math.round(bottom_c * scaleY);
-  const left0   = Math.round(left_c * scaleX);
-  const right0  = Math.round(right_c * scaleX);
-
-  const searchYf = Math.max(8, Math.floor(f.H * SEARCH_FR));
-  const searchXf = Math.max(8, Math.floor(f.W * SEARCH_FR));
-  const bandYf   = Math.max(3, Math.floor(f.H * BAND_FR));
-  const bandXf   = Math.max(3, Math.floor(f.W * BAND_FR));
-
-  let top_f    = refineEdge(f.rowSum, top0,    searchYf, bandYf);
-  let bottom_f = refineEdge(f.rowSum, bottom0, searchYf, bandYf);
-  let left_f   = refineEdge(f.colSum, left0,   searchXf, bandXf);
-  let right_f  = refineEdge(f.colSum, right0,  searchXf, bandXf);
-
-  // sécurité + mini padding
-  const padH = Math.max(1, Math.floor((bottom_f - top_f + 1) * 0.003));
-  const padW = Math.max(1, Math.floor((right_f  - left_f + 1) * 0.003));
-  top_f    = clamp(top_f - padH, 0, f.H - 2);
-  bottom_f = clamp(bottom_f + padH, top_f + 1, f.H - 1);
-  left_f   = clamp(left_f - padW, 0, f.W - 2);
-  right_f  = clamp(right_f + padW, left_f + 1, f.W - 1);
-
-  return {
-    x: (left_f / f.W) * 100,
-    y: (top_f / f.H) * 100,
-    w: ((right_f - left_f + 1) / f.W) * 100,
-    h: ((bottom_f - top_f + 1) / f.H) * 100,
-  };
-}
+  Auto-calage HQ (implémentation extraite vers utils/detectContentRect.ts)
+  ========================= */
 
 /* =========================
    Feuilles → templates
@@ -272,22 +85,18 @@ async function detectContentRectFromUrl(
 
 function loadAvailableSheetsForUser(): SheetTemplate[] {
   const documents = getDocuments() || [];
-  const sheets: SheetTemplate[] = documents.map((doc: any) => {
+  return documents.map((doc: any) => {
     const refWidth = Number(doc.pageWidth) || Number(doc.canvasWidth) || 2100;
     const refHeight = Number(doc.pageHeight) || Number(doc.canvasHeight) || 2970;
-
     const coordUnit: 'px' | 'pct' = (doc.coordUnit === 'px' || doc.coordUnit === 'pct') ? doc.coordUnit : 'px';
-
     const zones: OverlayZone[] = (doc.zones ?? []).map((z: any, index: number) => {
       const pageRaw = z.page ?? z.pageIndex ?? 0;
       const page0 = typeof pageRaw === 'number' && pageRaw > 0 ? pageRaw - 1 : Number(pageRaw) || 0;
       const id = z.id ?? (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `zone_${index}_${Date.now()}`);
-
       const rawLeft = Number(z.left ?? z.x ?? 0);
       const rawTop = Number(z.top ?? z.y ?? 0);
       const rawW = Number(z.width ?? z.w ?? 10);
       const rawH = Number(z.height ?? z.h ?? 5);
-
       let x: number, y: number, width: number, height: number;
       if (coordUnit === 'px') {
         const rw = refWidth > 0 ? refWidth : 2100;
@@ -302,124 +111,10 @@ function loadAvailableSheetsForUser(): SheetTemplate[] {
         width = clamp(rawW, 0.5, 100);
         height = clamp(rawH, 0.5, 100);
       }
-
-      return { id, x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0, width: Number.isFinite(width) ? width : 5, height: Number.isFinite(height) ? height : 5, page: page0, code: z.code, label: z.code || `Zone ${id}` };
+      return { id, x, y, width, height, page: page0, code: z.code, label: z.code || `Zone ${id}`, isBarcode: !!z.isBarcode };
     });
-
-    return {
-      id: String(doc.id),
-      name: String(doc.name ?? 'Feuille'),
-      pagesPerPatient: Number(doc.pagesPerPatient ?? 1),
-      docType: (doc.docType ?? 'prestations') as 'divers' | 'prestations',
-      zones,
-      refWidth,
-      refHeight,
-      backgroundImage: doc.backgroundImage || null, // <<< important
-    };
+    return { id: String(doc.id), name: String(doc.name ?? 'Feuille'), pagesPerPatient: Number(doc.pagesPerPatient ?? 1), docType: (doc.docType ?? 'prestations'), zones, refWidth, refHeight, backgroundImage: doc.backgroundImage || null } as SheetTemplate;
   });
-
-  if (sheets.length === 0) {
-    return [{
-      id: 'demo_a4', name: 'Consultation (Démo A4)', pagesPerPatient: 1, docType: 'prestations',
-      refWidth: 2100, refHeight: 2970,
-      zones: [
-        { id: 'd1', x: 8, y: 35, width: 10, height: 4, page: 0, label: '012967' },
-        { id: 'd2', x: 8, y: 40, width: 10, height: 4, page: 0, label: '012969' },
-        { id: 'd3', x: 8, y: 60, width: 10, height: 4, page: 0, label: '012977' },
-        { id: 'd4', x: 8, y: 65, width: 10, height: 4, page: 0, label: '012978' },
-        { id: 'd5', x: 8, y: 70, width: 10, height: 4, page: 0, label: '012979' },
-      ],
-      backgroundImage: null,
-    }];
-  }
-  return sheets;
-}
-
-/* =========================
-   Calendrier inline (inchangé)
-   ========================= */
-
-type InlineCalendarProps = {
-  selected: string[];
-  onDayClick: (dateYMD: string, opts: { shift: boolean }) => void;
-  className?: string; disabled?: boolean;
-};
-
-const WEEK_LABELS = ['lu','ma','me','je','ve','sa','di'];
-
-function InlineCalendar({ selected, onDayClick, className = '', disabled = false }: InlineCalendarProps) {
-  const today = new Date();
-  const [viewYear, setViewYear] = useState(today.getFullYear());
-  const [viewMonth, setViewMonth] = useState(today.getMonth());
-  const firstOfMonth = new Date(viewYear, viewMonth, 1);
-  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
-  const offset = (firstOfMonth.getDay() + 6) % 7;
-
-  const isSelected = (d: number) => selected.includes(toYMD(new Date(viewYear, viewMonth, d)));
-  const gotoPrev = () => { if (viewMonth === 0) { setViewYear(y => y - 1); setViewMonth(11); } else setViewMonth(m => m - 1); };
-  const gotoNext = () => { if (viewMonth === 11) { setViewYear(y => y + 1); setViewMonth(0); } else setViewMonth(m => m + 1); };
-
-  const monthLabel = new Date(viewYear, viewMonth, 1).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
-
-  const cells: (number | null)[] = [
-    ...Array.from({ length: offset }, () => null),
-    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
-  ];
-
-  return (
-    <div className={`border rounded-md p-2 bg-white ${className}`}>
-      <div className="flex items-center justify-between mb-2">
-        <button onClick={gotoPrev} className="px-2 py-1 rounded hover:bg-gray-100" type="button" disabled={disabled}>‹</button>
-        <div className="text-sm font-medium capitalize">{monthLabel}</div>
-        <button onClick={gotoNext} className="px-2 py-1 rounded hover:bg-gray-100" type="button" disabled={disabled}>›</button>
-      </div>
-
-      <div className="grid grid-cols-7 gap-1 text-[11px] text-gray-500 mb-1">
-        {WEEK_LABELS.map(w => <div key={w} className="text-center uppercase">{w}</div>)}
-      </div>
-
-      <div className="grid grid-cols-7 gap-1">
-        {cells.map((d, idx) => {
-          if (d === null) return <div key={`e${idx}`} />;
-          const dateObj = new Date(viewYear, viewMonth, d);
-          const ymd = toYMD(dateObj);
-          const selectedDay = isSelected(d);
-          const isToday = toYMD(today) === ymd;
-          return (
-            <button
-              key={ymd}
-              type="button"
-              onMouseDown={(ev) => { if (disabled) return; ev.preventDefault(); onDayClick(ymd, { shift: (ev as React.MouseEvent).shiftKey }); }}
-              className={`h-8 rounded text-sm border transition-colors ${selectedDay ? 'bg-pink-500 text-white border-pink-600' : 'bg-white hover:bg-gray-50 border-gray-300'} ${isToday && !selectedDay ? 'ring-1 ring-pink-300' : ''} ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-              title={dateObj.toLocaleDateString('fr-FR')}
-              disabled={disabled}
-            >
-              {d}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/* =========================
-   ProgressBar (UI)
-   ========================= */
-function ProgressBar({ value, label, indeterminate = false }: { value?: number; label?: string; indeterminate?: boolean; }) {
-  const pct = typeof value === 'number' ? Math.max(0, Math.min(100, Math.round(value))) : 0;
-  return (
-    <div className="w-full">
-      <div className="flex items-center justify-between text-xs text-gray-600 mb-1">
-        <span>{label || 'Chargement…'}</span>
-        {!indeterminate && typeof value === 'number' ? <span>{pct}%</span> : <span>&nbsp;</span>}
-      </div>
-      <div className="h-2 w-full bg-gray-200 rounded overflow-hidden">
-        {indeterminate ? <div className="h-2 w-1/3 bg-pink-500 animate-pulse rounded" /> :
-          <div className="h-2 bg-pink-500 transition-all duration-200 rounded" style={{ width: `${pct}%` }} />}
-      </div>
-    </div>
-  );
 }
 
 /* =========================
@@ -523,7 +218,7 @@ function extractGrayROI(
   const { data } = ctx.getImageData(0, 0, targetW, targetH);
   const out = new Uint8ClampedArray(targetW * targetH);
   for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-    out[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    out[j] = 0.299 * data[i]! + 0.587 * data[i + 1]! + 0.114 * data[i + 2]!;
   }
   return out;
 }
@@ -538,7 +233,7 @@ function boxBlur3(src: Uint8ClampedArray, W: number, H: number): Uint8ClampedArr
         const yy = y + dy; if (yy < 0 || yy >= H) continue;
         for (let dx = -1; dx <= 1; dx++) {
           const xx = x + dx; if (xx < 0 || xx >= W) continue;
-          s += src[yy * W + xx]; n++;
+          s += src[yy * W + xx]!; n++;
         }
       }
       dst[y * W + x] = s / n;
@@ -665,7 +360,7 @@ function scoreZoneInk_ModelSub(
   const N = gScan.length;
   const delta = new Uint8ClampedArray(N);
   for (let i = 0; i < N; i++) {
-    const d = gModel[i] - gScan[i];     // plus sombre sur le scan que sur le modèle
+    const d = gModel[i]! - gScan[i]!;     // plus sombre sur le scan que sur le modèle
     delta[i] = d > 0 ? d : 0;
   }
   const deltaS = boxBlur3(delta, TW, TH);
@@ -702,7 +397,7 @@ function computeInkDensity(ctx: CanvasRenderingContext2D, rect: RectPx): number 
   // moyenne & écart-type (luminosité)
   let sum = 0, sum2 = 0;
   for (let i = 0; i < data.length; i += 4) {
-    const ylin = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+    const ylin = 0.2126 * data[i]! + 0.7152 * data[i + 1]! + 0.0722 * data[i + 2]!;
     sum += ylin; sum2 += ylin * ylin;
   }
   const mean = sum / len;
@@ -712,10 +407,22 @@ function computeInkDensity(ctx: CanvasRenderingContext2D, rect: RectPx): number 
 
   let dark = 0;
   for (let i = 0; i < data.length; i += 4) {
-    const ylin = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+    const ylin = 0.2126 * data[i]! + 0.7152 * data[i + 1]! + 0.0722 * data[i + 2]!;
     if (ylin < thr) dark++;
   }
   return dark / len;
+}
+
+/* =========================
+   Auto-cochage seuil adaptatif (extraction depuis analyse manquante)
+   ========================= */
+function pickThreshold(areaPx: number): number {
+  // Heuristique simple : plus la zone est grande, plus le seuil exigé augmente légèrement.
+  if (areaPx < 800) return 0.04;
+  if (areaPx < 2000) return 0.06;
+  if (areaPx < 4000) return 0.08;
+  if (areaPx < 8000) return 0.10;
+  return 0.12;
 }
 
 
@@ -730,7 +437,7 @@ interface Scan2OverlayModuleProps {
   embedded?: boolean; className?: string;
 }
 
-const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedded = false, className = '' }) => {
+const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ user: _user, onClose, embedded = false, className = '' }) => {
   const [file, setFile] = useState<File | null>(null);
   const [pageUrls, setPageUrls] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(0);
@@ -739,12 +446,21 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
 
   const [sheets, setSheets] = useState<SheetTemplate[]>([]);
   const [selectedSheetId, setSelectedSheetId] = useState<string>('');
-  const selectedSheet = useMemo(() => sheets.find(s => s.id === selectedSheetId) || null, [sheets, selectedSheetId]);
+  const selectedSheet = useMemo<SheetTemplate | null>(() => sheets.find((s: SheetTemplate) => s.id === selectedSheetId) || null, [sheets, selectedSheetId]);
+  // Initial load of available sheets
+  useEffect(() => {
+    const loaded = loadAvailableSheetsForUser();
+    setSheets(loaded);
+  if (!selectedSheetId && loaded.length > 0) setSelectedSheetId(loaded[0]!.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Encodage
   const [doctorId, setDoctorId] = useState('');
   const [useDoctorForAll, setUseDoctorForAll] = useState(false);
   const [stayNumber, setStayNumber] = useState('');
+  // Barcode decoding states
+  // (barcode states migrated to useBarcodeReader hook)
   const [currentDate, setCurrentDate] = useState(new Date().toISOString().split('T')[0]);
   const [isMultiDate, setIsMultiDate] = useState(false);
   const [selectedDates, setSelectedDates] = useState<string[]>([]);
@@ -770,140 +486,71 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   const [importProgress, setImportProgress] = useState<number>(0);
   const [importLabel, setImportLabel] = useState<string>('Préparation…');
 
-  // Rotation (on garde le mécanisme existant)
+  // Rotation & zoom
   const [pageRotations, setPageRotations] = useState<Record<number, number>>({});
   const [applyRotationToAll, setApplyRotationToAll] = useState(false);
   const rotation = pageRotations[currentPage] ?? 0;
-
-  // Drag/resize
-  const draggingRef = useRef<{ mode: 'move'|'n'|'s'|'e'|'w'|'ne'|'nw'|'se'|'sw'; startX: number; startY: number; startRect: RectPct; } | null>(null);
-
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const pageWrapRef = useRef<HTMLDivElement>(null);
   const [fitScale, setFitScale] = useState(1);
   const [zoomFactor, setZoomFactor] = useState(1);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const pageWrapRef = useRef<HTMLDivElement>(null);
 
+  // Patient pagination logic
   const pagesPerPatient = selectedSheet?.pagesPerPatient ?? 1;
   const patientIndex = useMemo(() => Math.floor(currentPage / pagesPerPatient), [currentPage, pagesPerPatient]);
   const totalPatients = useMemo(() => (pageUrls.length ? Math.ceil(pageUrls.length / pagesPerPatient) : 0), [pageUrls.length, pagesPerPatient]);
   const pageRelativeIndex = useMemo(() => currentPage % pagesPerPatient, [currentPage, pagesPerPatient]);
-
   const currentPatientPages = useMemo(() => {
     const start = patientIndex * pagesPerPatient;
     return pageUrls.slice(start, start + pagesPerPatient);
   }, [pageUrls, patientIndex, pagesPerPatient]);
-
-  const zonesForCurrentRelativePage = useMemo(() => selectedSheet ? selectedSheet.zones.filter(z => (z.page ?? 0) === pageRelativeIndex) : [], [selectedSheet, pageRelativeIndex]);
-
+  const zonesForCurrentRelativePage = useMemo(() => selectedSheet ? selectedSheet.zones.filter((z: OverlayZone) => (z.page ?? 0) === pageRelativeIndex) : [], [selectedSheet, pageRelativeIndex]);
   const normalizedZones = useMemo(() => {
-    if (!selectedSheet || !refRect) return [];
+    if (!selectedSheet || !refRect) return [] as any[];
     return normalizeZonesAgainstRect(selectedSheet.zones, pageRelativeIndex, refRect);
   }, [selectedSheet, pageRelativeIndex, refRect]);
 
-  /* ====== Persistences ====== */
-  useEffect(() => { setSheets(loadAvailableSheetsForUser()); }, []);
+  const { decodeBarcode, isDecodingBarcode, barcodeError, autoBarcodeEnabled, setAutoBarcodeEnabled, hasBarcodeZone } = useBarcodeReader({
+    normalizedZones, overlayRect, rotation, pageUrls, currentPage, stayNumber, setStayNumber, autoEnabledDefault: true,
+  });
+
+  // Refs (restored)
+  const objectUrlsRef = useRef<string[]>([]);
+  const detectionVersionRef = useRef(0);
+  const unmountedRef = useRef(false);
+  // Drag logic now in hook
+  // (drag hook will be initialized after dimensions are known)
 
   useEffect(() => {
-    try { const raw = localStorage.getItem('scan2overlay.zoomFactor'); if (raw) setZoomFactor(clamp(Number(raw) || 1, 0.2, 5)); } catch {}
+    return () => {
+      unmountedRef.current = true;
+  objectUrlsRef.current.forEach((u: string) => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
+    };
   }, []);
-  useEffect(() => { localStorage.setItem('scan2overlay.zoomFactor', String(zoomFactor)); }, [zoomFactor]);
 
-  // Charger refRect à la sélection de la feuille (backgroundImage si dispo)
-  useEffect(() => {
-    (async () => {
-      if (!selectedSheet) { setRefRect(null); setOverlayRect(null); setAutoRectByPage({}); return; }
-      try {
-        if (selectedSheet.backgroundImage) {
-          const rect = await detectContentRectFromUrl(selectedSheet.backgroundImage, { maxDim: 1800, marginPct: 0.012 });
-          setRefRect(rect);
-        } else {
-          const tight = computeTightRectPct(selectedSheet.zones, 0) || { x: 5, y: 5, w: 90, h: 90 };
-          setRefRect(tight);
-        }
-      } catch (e) {
-        console.warn('Ref content rect error:', e);
-        const fallback = computeTightRectPct(selectedSheet.zones, 0) || { x: 5, y: 5, w: 90, h: 90 };
-        setRefRect(fallback);
-      }
-      setOverlayRect(null); // recalculé à l’arrivée de la première page
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedSheetId]);
-
-  // Sauvegarde overlay lock par feuille
-  useEffect(() => {
-    if (!selectedSheetId) return;
-    localStorage.setItem(`scan2overlay.overlaylock.${selectedSheetId}`, overlayLocked ? '1' : '0');
-  }, [overlayLocked, selectedSheetId]);
-  useEffect(() => {
-    if (!selectedSheetId) return;
-    try {
-      const savedLock = localStorage.getItem(`scan2overlay.overlaylock.${selectedSheetId}`);
-      if (savedLock) setOverlayLocked(savedLock === '1');
-    } catch {}
-  }, [selectedSheetId]);
-
-  // Restaure champs patient au changement d’index
-  useEffect(() => {
-    const f = patientFields[patientIndex];
-    if (f) {
-      setDoctorId(f.doctorId); setStayNumber(f.stayNumber); setIsMultiDate(f.isMultiDate);
-      if (f.isMultiDate) { setSelectedDates(f.dates); setDateValidated(f.dateValidated); }
-      else { setCurrentDate(f.dates[0] || new Date().toISOString().split('T')[0]); setDateValidated(f.dateValidated); }
-    } else {
-      setStayNumber(''); if (!useDoctorForAll) setDoctorId('');
-      setIsMultiDate(false); setSelectedDates([]); setDateValidated(false);
-      setCurrentDate(new Date().toISOString().split('T')[0]);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [patientIndex]);
-
-  /* ====== Raccourci Save ====== */
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); if (canSave()) saveCurrentPatient(); } };
-    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey);
-  }, [doctorId, stayNumber, dateValidated, selectedSheetId, lockedByPatient, patientIndex]);
-
-  /* ====== Img load → fit + auto-calage page ====== */
-  const onImgLoad = async (e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget as HTMLImageElement;
-    const nat = { w: img.naturalWidth || 1000, h: img.naturalHeight || 1414 };
-    setImgNat(nat);
-
-    if (viewportRef.current) {
+  // Image load handler (fit to viewport once)
+  const onImgLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const imgEl = e.currentTarget;
+    setImgNat({ w: imgEl.naturalWidth || imgEl.width, h: imgEl.naturalHeight || imgEl.height });
+    if (viewportRef.current && imgEl) {
       const vw = viewportRef.current.clientWidth;
       const vh = viewportRef.current.clientHeight;
-      setFitScale(Math.min(vw / nat.w, vh / nat.h));
-    }
-
-    // Utilise le rect pré-analysé si disponible, sinon calcule (HQ)
-    const pre = autoRectByPage[currentPage];
-    if (pre) {
-      setOverlayRect(ignoreAutoByPage[currentPage] ? (refRect || pre) : pre);
-      return;
-    }
-
-    try {
-      if (pageUrls[currentPage]) {
-        const rect = await detectContentRectFromUrl(pageUrls[currentPage], { maxDim: 1800, marginPct: 0.012 });
-        setAutoRectByPage(prev => ({ ...prev, [currentPage]: rect }));
-        setOverlayRect(ignoreAutoByPage[currentPage] ? (refRect || rect) : rect);
+      if (imgEl.naturalWidth && imgEl.naturalHeight) {
+        const scale = Math.min(vw / imgEl.naturalWidth, vh / imgEl.naturalHeight, 1);
+        setFitScale(scale > 0 ? scale : 1);
       }
-    } catch (err) {
-      console.warn('Auto content rect failed:', err);
-      if (refRect) setOverlayRect(refRect);
     }
-  };
+  }, []);
 
   /* ====== Wheel Zoom ====== */
-  const onWheel = (e: React.WheelEvent) => { if (!imgNat) return; const dir = e.deltaY > 0 ? -1 : 1; setZoomFactor(zf => clamp(zf + dir * 0.08, 0.2, 5)); };
+  const onWheel = (e: React.WheelEvent) => { if (!imgNat) return; const dir = e.deltaY > 0 ? -1 : 1; setZoomFactor((zf: number) => clamp(zf + dir * 0.08, 0.2, 5)); };
 
   /* ====== Handlers ====== */
   function canSave() { return !!selectedSheet && !!doctorId && !!stayNumber && !!dateValidated && !lockedByPatient[patientIndex]; }
 
   function toggleZone(zoneId: string | number) {
     if (lockedByPatient[patientIndex]) return;
-    setZonesCheckedByPage(prev => { const current = { ...(prev[currentPage] || {}) }; current[zoneId] = !current[zoneId]; return { ...prev, [currentPage]: current }; });
+  setZonesCheckedByPage((prev: Record<number, Record<string | number, boolean>>) => { const current = { ...(prev[currentPage] || {}) }; current[zoneId] = !current[zoneId]; return { ...prev, [currentPage]: current }; });
   }
 
   function handleSelectSheet(e: React.ChangeEvent<HTMLSelectElement>) {
@@ -915,20 +562,25 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
     setAutoRectByPage({}); setIgnoreAutoByPage({});
   }
 
-  function goPrevPage() { setCurrentPage(p => Math.max(0, p - 1)); }
-  function goNextPage() { setCurrentPage(p => Math.min(pageUrls.length - 1, p + 1)); }
+  function goPrevPage() { setCurrentPage((p: number) => Math.max(0, p - 1)); }
+  function goNextPage() { setCurrentPage((p: number) => Math.min(pageUrls.length - 1, p + 1)); }
   function goPrevPatient() { if (patientIndex <= 0) return; setCurrentPage((patientIndex - 1) * pagesPerPatient); }
   function goNextPatient() { if (patientIndex >= totalPatients - 1) return; setCurrentPage((patientIndex + 1) * pagesPerPatient); }
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0]; if (!f) return;
+    // cleanup previous object URLs
+  objectUrlsRef.current.forEach((u: string) => { try { URL.revokeObjectURL(u); } catch {} });
+    objectUrlsRef.current = [];
     setError(''); setIsImporting(true); setImportProgress(0); setImportLabel('Préparation…');
     try {
+      const localVersion = ++detectionVersionRef.current;
       // 1) Conversion en images (avec sa propre progression)
       const pages = await convertFileToImages(f, (pct, label) => {
         if (typeof pct === 'number') setImportProgress(pct);
         if (label) setImportLabel(label);
       });
+      pages.forEach(p => { if (p.startsWith('blob:')) objectUrlsRef.current.push(p); });
 
       // 2) Init état UI
       setFile(f); setPageUrls(pages); setCurrentPage(0); setImgNat(null);
@@ -942,9 +594,11 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
       setImportLabel(`Analyse fine du contenu 0/${total}…`);
       setImportProgress(90);
       for (let i = 0; i < total; i++) {
+        if (localVersion !== detectionVersionRef.current || unmountedRef.current) break; // annulé
         setImportLabel(`Analyse fine du contenu ${i + 1}/${total}…`);
         setImportProgress(90 + Math.round(((i + 1) / total) * 10));
-        const r = await detectContentRectFromUrl(pages[i], { maxDim: 1800, marginPct: 0.012 });
+  const pageUrl = pages[i]!; // i < pages.length so defined
+  const r = await detectContentRectFromUrl(pageUrl, { maxDim: 1800, marginPct: 0.012 });
         newRects[i] = r;
         if (i === 0) setOverlayRect(ignoreAutoByPage[0] ? (refRect || r) : r);
       }
@@ -989,8 +643,8 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
       } else { console.error('Error saving patient data:', error); alert('Erreur lors de la sauvegarde. Veuillez réessayer.'); return; }
     }
 
-    setLockedByPatient(prev => ({ ...prev, [patientIndex]: true }));
-    setPatientFields(prev => ({ ...prev, [patientIndex]: { doctorId, stayNumber, isMultiDate, dates, dateValidated: true } }));
+  setLockedByPatient((prev: Record<number, boolean>) => ({ ...prev, [patientIndex]: true }));
+  setPatientFields((prev: typeof patientFields) => ({ ...prev, [patientIndex]: { doctorId, stayNumber, isMultiDate, dates, dateValidated: true } }));
 
     if (!useDoctorForAll) setDoctorId('');
     setStayNumber(''); setDateValidated(false); setSelectedDates([]);
@@ -1000,7 +654,7 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   }
 
   function unlockPatient() {
-    setLockedByPatient(prev => { const copy = { ...prev }; delete copy[patientIndex]; return copy; });
+  setLockedByPatient((prev: Record<number, boolean>) => { const copy = { ...prev }; delete copy[patientIndex]; return copy; });
     const f = patientFields[patientIndex];
     if (f) { setDoctorId(f.doctorId); setStayNumber(f.stayNumber); setIsMultiDate(f.isMultiDate); if (f.isMultiDate) setSelectedDates(f.dates); else setCurrentDate(f.dates[0] || new Date().toISOString().split('T')[0]); setDateValidated(f.dateValidated); }
   }
@@ -1012,53 +666,27 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   }
   function resetOverlayRect() { if (refRect) setOverlayRect(refRect); }
 
-  /* ====== Auto-cochage ====== */
-  const [isAutoChecking, setIsAutoChecking] = useState(false);
-
-  async function autoCheckFromScanCurrentPage() {
-    if (!overlayRect || !imgNat || !selectedSheet) {
-      setError("Overlay non prêt ou feuille non sélectionnée.");
-      return;
-    }
-    if (!pageUrls[currentPage]) {
-      setError("Aucune page à analyser.");
-      return;
-    }
-    if (lockedByPatient[patientIndex]) return;
-
-    setIsAutoChecking(true);
-    try {
-      // Canvas offscreen sur la page SANS rotation
-      const img = await loadImage(pageUrls[currentPage]);
-      const W = img.naturalWidth || img.width || imgNat.w;
-      const H = img.naturalHeight || img.height || imgNat.h;
-      const canvas = document.createElement('canvas');
-      canvas.width = W; canvas.height = H;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Canvas 2D indisponible.');
-      ctx.drawImage(img, 0, 0, W, H);
-
-      const results: Record<string | number, boolean> = {};
-      for (const z of normalizedZones) {
-        const zPx = zonePctToPagePx({ x: z.x, y: z.y, w: z.width, h: z.height }, overlayRect, W, H);
-        const inner = shrinkRect(zPx, INNER_MARGIN_PCT);
-        const density = computeInkDensity(ctx, inner);
-        const areaPx = inner.w * inner.h;
-        const thr = pickThreshold(areaPx);
-        const checked = density >= thr; 
-        results[z.id] = checked;
-      }
-
-      setZonesCheckedByPage(prev => ({
-        ...prev,
-        [currentPage]: { ...(prev[currentPage] || {}), ...results }
-      }));
-    } catch (e: any) {
-      setError(e?.message || 'Auto-cochage impossible sur cette page.');
-    } finally {
-      setIsAutoChecking(false);
-    }
-  }
+  /* ====== Auto-cochage (hook) ====== */
+  const { isAutoChecking, autoCheckFromScanCurrentPage } = useAutoCheck({
+    overlayRect,
+    imgNat,
+    selectedSheet,
+    pageUrls,
+    currentPage,
+    normalizedZones,
+    detectionVersionRef,
+    unmountedRef,
+    loadImage,
+    zonePctToPagePx,
+    shrinkRect,
+    INNER_MARGIN_PCT,
+    computeInkDensity,
+    pickThreshold,
+    lockedByPatient,
+    patientIndex,
+    setError,
+    setZonesCheckedByPage,
+  });
 
   /* ====== Zoom / dimensions page ====== */
   const pageScale = fitScale * zoomFactor;
@@ -1068,6 +696,15 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
 
   const wrapWidthPx  = rotation % 180 === 0 ? pageWidthPx  : pageHeightPx;
   const wrapHeightPx = rotation % 180 === 0 ? pageHeightPx : pageWidthPx;
+
+  const { beginDrag } = useOverlayDrag({
+    overlayRect,
+    overlayLocked,
+    rotation,
+    wrapWidthPx: wrapWidthPx || 0,
+    wrapHeightPx: wrapHeightPx || 0,
+    setOverlayRect,
+  });
 
   const checkedCountThisPage = useMemo(() => Object.values(zonesCheckedByPage[currentPage] || {}).filter(Boolean).length, [zonesCheckedByPage, currentPage]);
 
@@ -1083,12 +720,12 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   const handleCalendarDayClick = (ymd: string, opts: { shift: boolean }) => {
     if (lockedByPatient[patientIndex]) return;
     const useShift = Boolean(opts?.shift) || isShiftDown;
-    setSelectedDates(old => {
+  setSelectedDates((old: string[]) => {
       if (useShift && lastClickedRef.current) {
         const range = daysBetweenInclusive(lastClickedRef.current!, ymd);
         const s = new Set(old); for (const d of range) s.add(d);
         return Array.from(s).sort();
-      } else return old.includes(ymd) ? old.filter(d => d !== ymd) : [...old, ymd].sort();
+  } else return old.includes(ymd) ? old.filter((d: string) => d !== ymd) : [...old, ymd].sort();
     });
     setDateValidated(false);
     lastClickedRef.current = ymd;
@@ -1096,7 +733,7 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
 
   /* ====== Rotation handlers ====== */
   function rotatePages(deltaCW: number) {
-    setPageRotations(prev => {
+  setPageRotations((prev: Record<number, number>) => {
       const next: Record<number, number> = { ...prev };
       if (applyRotationToAll) for (let i = 0; i < pageUrls.length; i++) next[i] = normAngle((next[i] ?? 0) + deltaCW);
       else next[currentPage] = normAngle((next[currentPage] ?? 0) + deltaCW);
@@ -1105,36 +742,6 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   }
 
   /* ====== Drag overlay ====== */
-  const beginDrag = useCallback((mode: 'move'|'n'|'s'|'e'|'w'|'ne'|'nw'|'se'|'sw', e: React.MouseEvent) => {
-    if (!overlayRect || overlayLocked) return; e.preventDefault(); e.stopPropagation();
-    draggingRef.current = { mode, startX: e.clientX, startY: e.clientY, startRect: { ...overlayRect } };
-
-    const onMouseMove = (ev: MouseEvent) => {
-      if (!draggingRef.current) return;
-      const { mode, startX, startY, startRect } = draggingRef.current;
-      const wRef = (wrapWidthPx || 1); const hRef = (wrapHeightPx || 1);
-      const dxDisp = ((ev.clientX - startX) / wRef) * 100;
-      const dyDisp = ((ev.clientY - startY) / hRef) * 100;
-      const { dx, dy } = mapDisplayDeltaToModel(dxDisp, dyDisp, rotation);
-
-      let r = { ...startRect };
-      if (mode === 'move') { r.x = clamp(startRect.x + dx, 0, 100 - startRect.w); r.y = clamp(startRect.y + dy, 0, 100 - startRect.h); }
-      else if (mode === 'n') { const ny = clamp(startRect.y + dy, 0, startRect.y + startRect.h - 1); r.y = ny; r.h = startRect.h + (startRect.y - ny); }
-      else if (mode === 's') { r.h = clamp(startRect.h + dy, 1, 100 - startRect.y); }
-      else if (mode === 'w') { const nx = clamp(startRect.x + dx, 0, startRect.x + startRect.w - 1); r.x = nx; r.w = startRect.w + (startRect.x - nx); }
-      else if (mode === 'e') { r.w = clamp(startRect.w + dx, 1, 100 - startRect.x); }
-      else if (mode === 'nw') { const nx = clamp(startRect.x + dx, 0, startRect.x + startRect.w - 1); const ny = clamp(startRect.y + dy, 0, startRect.y + startRect.h - 1); r.x = nx; r.y = ny; r.w = startRect.w + (startRect.x - nx); r.h = startRect.h + (startRect.y - ny); }
-      else if (mode === 'ne') { const ny = clamp(startRect.y + dy, 0, startRect.y + startRect.h - 1); r.y = ny; r.w = clamp(startRect.w + dx, 1, 100 - startRect.x); r.h = startRect.h + (startRect.y - ny); }
-      else if (mode === 'sw') { const nx = clamp(startRect.x + dx, 0, startRect.x + startRect.w - 1); r.x = nx; r.w = startRect.w + (startRect.x - nx); r.h = clamp(startRect.h + dy, 1, 100 - startRect.y); }
-      else if (mode === 'se') { r.w = clamp(startRect.w + dx, 1, 100 - startRect.x); r.h = clamp(startRect.h + dy, 1, 100 - startRect.y); }
-
-      setOverlayRect(r);
-    };
-    const onMouseUp = () => { draggingRef.current = null; document.removeEventListener('mousemove', onMouseMove); document.removeEventListener('mouseup', onMouseUp); };
-
-    document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
-  }, [overlayRect, overlayLocked, wrapWidthPx, wrapHeightPx, rotation]);
 
   /* =========================
      Rendu
@@ -1145,11 +752,12 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
   const zonesDisplay = useMemo(() => {
     if (!normalizedZones) return [];
     const a = rotation;
-    return normalizedZones.map(z => {
+  return normalizedZones.map((z: any) => {
       const r = rotateRectPct({ x: z.x, y: z.y, w: z.width, h: z.height }, a);
       return { ...z, x: r.x, y: r.y, width: r.w, height: r.h };
     });
   }, [normalizedZones, rotation]);
+
 
   return (
     <div className={rootClass}>
@@ -1236,7 +844,23 @@ const Scan2OverlayModule: React.FC<Scan2OverlayModuleProps> = ({ onClose, embedd
                 )}
 
                 <label htmlFor="stayNumber" className="block text-xs text-gray-600 mb-1">Numéro de séjour *</label>
-                <input id="stayNumber" type="text" value={stayNumber} onChange={(e) => setStayNumber(e.target.value)} disabled={lockedByPatient[patientIndex] || isImporting} className={`w-full border rounded-md p-2 text-sm disabled:bg-gray-100 focus:outline-none focus:ring-2 ${S2O_ACCENT_RING} mb-3`} placeholder="Ex: 20250118001" />
+                <div className="flex gap-2 mb-1">
+                  <input id="stayNumber" type="text" value={stayNumber} onChange={(e) => setStayNumber(e.target.value)} disabled={lockedByPatient[patientIndex] || isImporting} className={`flex-1 border rounded-md p-2 text-sm disabled:bg-gray-100 focus:outline-none focus:ring-2 ${S2O_ACCENT_RING}`} placeholder="Ex: 20250118001" />
+                  <Button variant="tertiary" size="sm" onClick={decodeBarcode} disabled={isDecodingBarcode || !overlayRect || !hasBarcodeZone || lockedByPatient[patientIndex] || isImporting} title="Lire le code-barres dans la zone dédiée (Code 39)">
+                    {isDecodingBarcode ? 'Lecture…' : 'Lire code-barres'}
+                  </Button>
+                </div>
+                {!hasBarcodeZone && (
+                  <div className="text-[10px] text-gray-500 mb-2">Aucune zone de code-barres marquée sur cette page.</div>
+                )}
+                {barcodeError && (
+                  <div className="text-[11px] text-red-600 mb-2">{barcodeError}</div>
+                )}
+                <label className="mt-1 mb-2 flex items-center gap-2 text-[11px] text-gray-600 select-none">
+                  <input type="checkbox" className="w-4 h-4" checked={autoBarcodeEnabled} onChange={(e) => setAutoBarcodeEnabled(e.target.checked)} disabled={lockedByPatient[patientIndex] || isImporting} />
+                  Lecture automatique du code-barres
+                  {isDecodingBarcode && <span className="ml-1 animate-pulse text-pink-600">●</span>}
+                </label>
 
                 <label htmlFor="doctorId" className="block text-xs text-gray-600 mb-1">Numéro de médecin *</label>
                 <input id="doctorId" type="text" value={doctorId} onChange={(e) => setDoctorId(e.target.value)} disabled={lockedByPatient[patientIndex] || isImporting} className={`w-full border rounded-md p-2 text-sm disabled:bg-gray-100 focus:outline-none focus:ring-2 ${S2O_ACCENT_RING}`} placeholder="Ex: 123456" />

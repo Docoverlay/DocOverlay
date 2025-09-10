@@ -28,6 +28,30 @@ npm run preview  # prévisualiser le build
 3. `npm install`
 4. `npm run dev`
 
+### Installation Node.js (Windows)
+Option simple (winget) :
+```
+winget install OpenJS.NodeJS.LTS
+```
+Puis rouvrir un terminal :
+```
+node -v
+npm -v
+```
+
+Option multi‑versions (recommandé) : installer nvm-windows :
+1. Télécharger `nvm-setup.exe` : https://github.com/coreybutler/nvm-windows/releases
+2. Installer, rouvrir PowerShell
+3. Choisir version :
+```
+nvm install 20.16.0
+nvm use 20.16.0
+node -v
+npm -v
+```
+
+Si `npm` introuvable : redémarrer la session ou vérifier la variable PATH.
+
 ## Structure
 ```
 project/
@@ -36,6 +60,8 @@ project/
     components/      # UI et vues
     hooks/           # hooks personnalisés
     utils/           # helpers
+  geometry.ts    # utilitaires géométrie/rotation (testés)
+  detectContentRect.ts # détection HQ cadre contenu
     data/            # données mock
     pdf/             # initialisation PDF
 ```
@@ -57,11 +83,25 @@ npm run test
 ```
 Un rapport texte s’affiche et `coverage/lcov-report/index.html` peut être ouvert dans un navigateur.
 
+### Tests unitaires ajoutés
+Des tests couvrent les fonctions de géométrie (`rotateRectPct`, `mapDisplayDeltaToModel`, etc.). Exécuter :
+```
+npm test
+```
+Mode watch UI :
+```
+npm run test:ui
+```
+
 ## Roadmap (suggestions)
 - Auth réelle (API)
 - Tests unitaires (Vitest / React Testing Library)
 - CI GitHub Actions (build + lint)
 - Déploiement (Netlify / Vercel)
+ - Offload détection contenu & auto-cochage vers Web Worker
+ - Plus de tests (détection, auto-cochage)
+ - Lazy loading PDF worker / dynamic import
+ - Optimisation mémoire (revocation URL blobs après usage)
 
 ## Licence
 Projet sous licence MIT (voir `LICENSE`).

@@ -1,10 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { FileImage, AlertCircle, Zap, Shield, Download, Clipboard } from 'lucide-react';
+import { FileImage, AlertCircle, Zap, Download } from 'lucide-react';
 import Toolbar from './Toolbar';
 import Legend from './Legend';
 import ContextMenu from './ContextMenu';
 import ZoneComponent from './ZoneComponent';
 import { Zone, DocType, User, SavedDocument, ConvertedDocument } from '../types';
+import { zonesOverlap, zonesToPercent } from '../utils/zones';
+import AccessDenied from './AccessDenied';
+import useAutoDetection from '../hooks/useAutoDetection';
+import useZones from '../hooks/useZones';
 import { saveDocument, updateDocument } from '../utils/database';
 import {
   convertDocumentToImages,
@@ -13,30 +17,7 @@ import {
   getFileTypeDescription
 } from '../utils/documentConverter';
 
-// ===== Util: détection de superposition (touching = OK, overlap = NOK) =====
-function zonesOverlap(a: Zone, b: Zone) {
-  return !(
-    a.left + a.width <= b.left ||
-    a.left >= b.left + b.width ||
-    a.top + a.height <= b.top ||
-    a.top >= b.top + b.height
-  );
-}
-
-// ===== Util: conversion zones px -> % (par rapport à pageWidth/pageHeight) =====
-function zonesToPercent(zs: Zone[], baseW: number, baseH: number) {
-  if (!baseW || !baseH) return [];
-  return zs.map(z => ({
-    id: z.id,
-    leftPct: (z.left / baseW) * 100,
-    topPct: (z.top / baseH) * 100,
-    widthPct: (z.width / baseW) * 100,
-    heightPct: (z.height / baseH) * 100,
-    code: z.code ?? '',
-    locked: !!z.locked,
-    checked: !!z.checked,
-  }));
-}
+// util functions moved to ../utils/zones
 
 interface DocumentEditorProps {
   user: User;
@@ -45,23 +26,9 @@ interface DocumentEditorProps {
 }
 
 export default function DocumentEditor({ user, onBack, editingDocument }: DocumentEditorProps) {
-  // Guard rôles
-  if (user.role !== 'ADMIN' && user.role !== 'SUPERADMIN') {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-red-50 to-red-100 flex items-center justify-center">
-        <div className="bg-white rounded-lg shadow-xl p-8 text-center">
-          <Shield className="w-16 h-16 mx-auto mb-4 text-red-600" />
-          <h1 className="text-2xl font-bold text-gray-900 mb-2">Accès refusé</h1>
-          <p className="text-gray-600 mb-6">Vous n'avez pas les permissions nécessaires pour accéder à l'éditeur de feuilles.</p>
-          <button
-            onClick={onBack}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
-          >
-            Retour au tableau de bord
-          </button>
-        </div>
-      </div>
-    );
+  // Guard rôles (align with existing lower-case roles if needed)
+  if (user.role !== 'admin' && user.role !== 'super_admin') {
+    return <AccessDenied onBack={onBack} />;
   }
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -69,70 +36,47 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
   const menuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // State
-  const [zones, setZones] = useState<Zone[]>(editingDocument?.zones || []);
-  const [history, setHistory] = useState<Zone[][]>([editingDocument?.zones || []]);
+  // Error/success helpers first
+  const [error, setError] = useState<string>('');
+  const [success, setSuccess] = useState<string>('');
+  const showError = (message: string) => { setError(message); setTimeout(() => setError(''), 5000); };
+  const showSuccess = (message: string) => { setSuccess(message); setTimeout(() => setSuccess(''), 3000); };
 
-  const [fillMode, setFillMode] = useState(false);
-  const [fillOrder, setFillOrder] = useState<Zone[]>([]);
-  const [currentFillIndex, setCurrentFillIndex] = useState(0);
+  const { zones, setZones, zonesRef, lastSize, setLastSize, commitHistory, undo, deleteZone: deleteZoneBase, updateZone: updateZoneBase } = useZones({
+    initialZones: editingDocument?.zones || [],
+  });
+
+  // Removed fillMode/fillOrder/currentFillIndex (unused) to slim component
   const [scale, setScale] = useState(1);
   const [currentZone, setCurrentZone] = useState<Zone | null>(null);
   const [copiedSize, setCopiedSize] = useState<{ width: number; height: number } | null>(null);
-  const [lastSize, setLastSize] = useState({ w: 80, h: 30 });
   const [documentName, setDocumentName] = useState(editingDocument?.name || '');
   const [docType, setDocType] = useState<DocType>(editingDocument?.docType || '');
   const [providerCode, setProviderCode] = useState(editingDocument?.providerCode || '');
   const [bgSrc, setBgSrc] = useState<string | null>(editingDocument?.backgroundImage || null);
-  const [error, setError] = useState<string>('');
-  const [success, setSuccess] = useState<string>('');
   const [autoDetectionMode, setAutoDetectionMode] = useState(false);
-  const [previewBox, setPreviewBox] = useState<{ top: number; left: number; width: number; height: number; } | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
+  // auto-detection preview state now handled by hook
+  // removed isProcessing (deprecated)
   const [convertedDocument, setConvertedDocument] = useState<ConvertedDocument | null>(
     editingDocument?.convertedDocument || null
   );
   const [isConverting, setIsConverting] = useState(false);
   const [conversionProgress, setConversionProgress] = useState<ConversionProgress | null>(null);
-  const [justResized, setJustResized] = useState(false);
+  // removed justResized (no longer required after refactor)
 
   // ===== Historique "léger" + ref pour lecture instantanée pendant le drag
-  const zonesRef = useRef<Zone[]>(zones);
-  useEffect(() => { zonesRef.current = zones; }, [zones]);
-
-  const commitHistory = (snapshot?: Zone[]) => {
-    const snap = (snapshot ?? zonesRef.current).map(z => ({ ...z }));
-    setHistory(h => [...h, snap]);
-  };
+  // zones + history handled by useZones
 
   // CTRL+Z / CMD+Z (Undo)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-        e.preventDefault();
-        setHistory((hist) => {
-          if (hist.length > 1) {
-            const newHist = hist.slice(0, hist.length - 1);
-            setZones(newHist[newHist.length - 1]);
-            return newHist;
-          }
-          return hist;
-        });
-      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [undo]);
 
-  const deleteZone = (id: number) => {
-    setZones(prev => {
-      const nz = prev.filter(z => z.id !== id);
-      commitHistory(nz);
-      return nz;
-    });
-    setCurrentZone(null);
-    if (menuRef.current) menuRef.current.style.display = 'none';
-  };
+  const deleteZone = (id: number) => { deleteZoneBase(id); setCurrentZone(null); if (menuRef.current) menuRef.current.style.display = 'none'; };
 
   // SUPPR
   useEffect(() => {
@@ -174,8 +118,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
     return () => document.removeEventListener('click', handleClick);
   }, []);
 
-  const showError = (message: string) => { setError(message); setTimeout(() => setError(''), 5000); };
-  const showSuccess = (message: string) => { setSuccess(message); setTimeout(() => setSuccess(''), 3000); };
+  // helpers already defined
 
   // === Navigation multi-page ===
   const handlePageNavigation = (direction: 'prev' | 'next') => {
@@ -226,148 +169,46 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
       checked: false
     };
 
-    setZones(prev => {
-      const nz = [...prev, newZone];
-      commitHistory(nz);
-      return nz;
-    });
+  setZones((prev: Zone[]) => { const nz = [...prev, newZone]; commitHistory(nz); return nz; });
     showSuccess('Nouvelle zone ajoutée !');
   };
 
+  const addBarcodeZone = () => {
+    if (!documentName.trim()) { showError('Veuillez saisir un nom pour le document.'); return; }
+    if (!docType) { showError('Veuillez sélectionner le type de document.'); return; }
+    if (docType === 'divers' && !providerCode.trim()) { showError('Veuillez indiquer le code prestataire pour les frais divers.'); return; }
+    const img = imgRef.current;
+    if (!img) { showError('Veuillez d\'abord charger une image.'); return; }
+
+    const newZone: Zone = {
+      id: Date.now(),
+      top: 80,
+      left: 80,
+      width: Math.max(160, lastSize.w * 2),
+      height: Math.max(50, lastSize.h),
+      code: '',
+      locked: false,
+      checked: false,
+      isBarcode: true,
+    };
+    setZones((prev: Zone[]) => { const nz = [...prev, newZone]; commitHistory(nz); return nz; });
+    showSuccess('Zone code-barres ajoutée.');
+  };
+
   // === Détection auto (inchangée) ===
-  const detectBoxAtPoint = async (
-    x: number, y: number, imageElement: HTMLImageElement
-  ): Promise<{ top: number; left: number; width: number; height: number } | null> => {
-    return new Promise((resolve) => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { resolve(null); return; }
-      canvas.width = imageElement.naturalWidth;
-      canvas.height = imageElement.naturalHeight;
-      ctx.drawImage(imageElement, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
+  // detection logic moved to utils/autoDetection
 
-      const getBrightness = (px: number, py: number): number => {
-        if (px < 0 || px >= canvas.width || py < 0 || py >= canvas.height) return 255;
-        const i = (py * canvas.width + px) * 4;
-        return (data[i] + data[i+1] + data[i+2]) / 3;
-      };
-      const DARKNESS_THRESHOLD = 150;
-      const MIN_LINE_CONTINUITY = 8;
-
-      function isInsideAnyZone(px: number, py: number): boolean {
-        return zones.some(z => (
-          px >= z.left && px <= z.left + z.width &&
-          py >= z.top  && py <= z.top + z.height
-        ));
-      }
-
-      const isLinePixel = (px: number, py: number, dx: number, dy: number): boolean => {
-        if (px < 0 || px >= canvas.width || py < 0 || py >= canvas.height) return false;
-        if (getBrightness(px, py) > DARKNESS_THRESHOLD) return false;
-        let continuity = 0;
-        for (let i = 1; i <= MIN_LINE_CONTINUITY; i++) {
-          const nx = px + dx*i, ny = py + dy*i;
-          if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height && getBrightness(nx, ny) < DARKNESS_THRESHOLD) continuity++;
-          else break;
-        }
-        for (let i = 1; i <= MIN_LINE_CONTINUITY; i++) {
-          const nx = px - dx*i, ny = py - dy*i;
-          if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height && getBrightness(nx, ny) < DARKNESS_THRESHOLD) continuity++;
-          else break;
-        }
-        return continuity >= MIN_LINE_CONTINUITY;
-      };
-
-      const findNearestBorder = (startX: number, startY: number, direction: 'left' | 'right' | 'up' | 'down'): number => {
-        const stepX = direction === 'left' ? -1 : direction === 'right' ? 1 : 0;
-        const stepY = direction === 'up' ? -1 : direction === 'down' ? 1 : 0;
-        let currentX = startX, currentY = startY;
-        const maxSearch = Math.min(canvas.width, canvas.height) / 15;
-        let distance = 0;
-        while (distance < maxSearch) {
-          currentX += stepX; currentY += stepY; distance++;
-          if (currentX < 0 || currentX >= canvas.width || currentY < 0 || currentY >= canvas.height) break;
-          if (isLinePixel(currentX, currentY, stepX === 0 ? 1 : 0, stepY === 0 ? 1 : 0)) {
-            return direction === 'left' || direction === 'right' ? currentX : currentY;
-          }
-          if (isInsideAnyZone(currentX, currentY)) {
-            return direction === 'left' || direction === 'right' ? currentX : currentY;
-          }
-        }
-        return -1;
-      };
-
-      const startX = Math.floor(x);
-      const startY = Math.floor(y);
-      const leftBorder = findNearestBorder(startX, startY, 'left');
-      const rightBorder = findNearestBorder(startX, startY, 'right');
-      const topBorder = findNearestBorder(startX, startY, 'up');
-      const bottomBorder = findNearestBorder(startX, startY, 'down');
-
-      if (topBorder === -1 || bottomBorder === -1 || leftBorder === -1 || rightBorder === -1) {
-        resolve(null); return;
-      }
-      const minBoxWidth = canvas.width * 0.008;
-      const minBoxHeight = canvas.height * 0.004;
-      const maxBoxWidth = canvas.width * 0.6;
-      const maxBoxHeight = canvas.height * 0.4;
-      const width = rightBorder - leftBorder;
-      const height = bottomBorder - topBorder;
-
-      if (width > minBoxWidth && height > minBoxHeight && width < maxBoxWidth && height < maxBoxHeight) {
-        resolve({
-          top: (topBorder / canvas.height) * 100,
-          left: (leftBorder / canvas.width) * 100,
-          width: (width / canvas.width) * 100,
-          height: (height / canvas.height) * 100
-        });
-      } else {
-        resolve(null);
-      }
-    });
-  };
-
-  const handleAutoDetectionMouseMove = async (e: React.MouseEvent) => {
-    if (!autoDetectionMode) { setPreviewBox(null); return; }
-    const container = containerRef.current;
-    const imageElement = container?.querySelector('img') as HTMLImageElement;
-    if (!container || !imageElement || !bgSrc) { setPreviewBox(null); return; }
-    const rect = imageElement.getBoundingClientRect();
-    if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) { setPreviewBox(null); return; }
-    const x = ((e.clientX - rect.left) / rect.width) * imageElement.naturalWidth;
-    const y = ((e.clientY - rect.top) / rect.height) * imageElement.naturalHeight;
-    const detectedBox = await detectBoxAtPoint(x, y, imageElement);
-    setPreviewBox(detectedBox);
-  };
-
-  const handleAutoDetectionClick = () => {
-    if (justResized) return;
-    if (previewBox) {
-      const newZone: Zone = {
-        id: Date.now(),
-        top: (previewBox.top / 100) * (imgRef.current?.naturalHeight || 1),
-        left: (previewBox.left / 100) * (imgRef.current?.naturalWidth || 1),
-        width: (previewBox.width / 100) * (imgRef.current?.naturalWidth || 1),
-        height: (previewBox.height / 100) * (imgRef.current?.naturalHeight || 1),
-        code: '',
-        locked: false,
-        checked: false
-      };
-      const overlap = zones.some(z => zonesOverlap(z, newZone));
-      if (overlap) { showError('Impossible de créer une zone ici : une autre zone existe déjà à cet endroit.'); return; }
-      setZones(prev => {
-        const nz = [...prev, newZone];
-        commitHistory(nz);
-        return nz;
-      });
-      setPreviewBox(null);
-      showSuccess('Case détectée automatiquement !');
-    } else {
-      showError('Impossible de détecter une case à cet endroit. Essayez de cliquer au centre d\'une case bien délimitée.');
-    }
-  };
+  const { previewBox, setPreviewBox, handleMouseMove: handleAutoDetectionMouseMove, handleClick: handleAutoDetectionClick } = useAutoDetection({
+    autoDetectionMode,
+    imgRef,
+    containerRef,
+    bgSrc,
+    zones,
+    setZones,
+    commitHistory,
+    showError,
+  showSuccess,
+  });
 
   // ---- Ajout manuel via clic droit (inchangé)
   const handleAddZoneWithContextMenu = (e: React.MouseEvent) => {
@@ -431,11 +272,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
     const overlap = zones.some(z => zonesOverlap(z, newZone));
     if (overlap) { showError('Impossible de créer une zone de cette taille à cet endroit : elle chevauche une zone existante.'); return; }
 
-    setZones(prev => {
-      const nz = [...prev, newZone];
-      commitHistory(nz);
-      return nz;
-    });
+  setZones((prev: Zone[]) => { const nz = [...prev, newZone]; commitHistory(nz); return nz; });
 
     setLastSize({ w: adjustedWidth, h: adjustedHeight });
     showSuccess('Nouvelle zone ajoutée !');
@@ -443,24 +280,8 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
 
   // ---- UPDATE/MOVE/RESIZE (anti-chevauchement conservé, aucun snap)
   const updateZone = (id: number, props: Partial<Zone>) => {
-    setZones(prev =>
-      prev.map(z => {
-        if (z.id === id) {
-          const simulated = { ...z, ...props };
-          const collision = prev.some(other => other.id !== id && zonesOverlap(simulated, other));
-          if (collision) {
-            showError("Superposition interdite : la zone recoupe une autre zone !");
-            return z;
-          }
-          return simulated;
-        }
-        return z;
-      })
-    );
-    if (currentZone?.id === id) setCurrentZone(prev => prev ? { ...prev, ...props } : null);
-    if (props.width !== undefined || props.height !== undefined) {
-      setLastSize(prev => ({ w: props.width ?? prev.w, h: props.height ?? prev.h }));
-    }
+    updateZoneBase(id, props, () => showError('Superposition interdite : la zone recoupe une autre zone !'));
+  if (currentZone?.id === id) setCurrentZone((prev: Zone | null) => prev ? { ...prev, ...props } : null);
   };
 
   // ===== DRAG ULTRA-FLUIDE (DOM transform + vérif collision uniquement au mouseup)
@@ -503,7 +324,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
 
       // si pas de collision -> on mémorise la dernière position OK
       const candidate: Zone = { ...zone, top: candTop, left: candLeft };
-      const collides = others.some(o => o.id !== zone.id && zonesOverlap(candidate, o));
+  const collides = others.some((o: Zone) => o.id !== zone.id && zonesOverlap(candidate, o));
       if (!collides) lastValid = { top: candTop, left: candLeft };
 
       // feedback visuel immédiat
@@ -519,16 +340,11 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
       // reset transform et commit de la position finale (anti-chevauchement respecté via lastValid)
       if (zoneEl) zoneEl.style.transform = '';
 
-      setZones(prev => {
-        const updated = prev.map(z =>
-          z.id === zone.id ? { ...z, top: lastValid.top, left: lastValid.left } : z
-        );
+      setZones((prev: Zone[]) => {
+        const updated = prev.map((z: Zone) => z.id === zone.id ? { ...z, top: lastValid.top, left: lastValid.left } : z);
         commitHistory(updated);
         return updated;
       });
-
-      setJustResized(true);
-      setTimeout(() => setJustResized(false), 50);
     };
 
     document.addEventListener('mousemove', onMouseMove, { passive: false });
@@ -578,9 +394,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
     const onMouseUp = () => {
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
-      commitHistory();
-      setJustResized(true);
-      setTimeout(() => setJustResized(false), 50);
+  commitHistory();
     };
 
     document.addEventListener('mousemove', onMouseMove);
@@ -645,17 +459,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
   };
 
   // ====== NOUVEAU: Canvas de référence (si besoin d’un HTMLCanvas côté Scan2Overlay) ======
-  const getTemplateCanvas = (): HTMLCanvasElement | null => {
-    const img = imgRef.current;
-    if (!img) return null;
-    const canvas = document.createElement('canvas');
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    return canvas;
-  };
+  // getTemplateCanvas removed (unused)
 
   // ====== NOUVEAU: Export “modèle pour Scan2Overlay” ======
   const exportScanTemplate = async () => {
@@ -828,7 +632,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
                   onUpload={onUpload}
                   autoDetectionMode={autoDetectionMode}
                   setAutoDetectionMode={setAutoDetectionMode}
-                  isProcessing={isProcessing}
+                  isProcessing={false}
                   bgSrc={bgSrc}
                   convertedDocument={convertedDocument}
                   isConverting={isConverting}
@@ -838,6 +642,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
                   onClearDocument={handleClearDocument}
                   // Bonus: export JSON "éditeur"
                   onExportJSON={exportJSON}
+                  onAddBarcodeZone={addBarcodeZone}
                 />
               </div>
               <div className="bg-white rounded-lg shadow p-3">
@@ -854,8 +659,7 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
                   <strong>Mode détection automatique activé</strong>
                 </div>
                 <p className="text-sm">
-                  Cliquez au centre d'une case du tableau pour créer automatiquement une zone correspondante. L'algorithme ignore le texte et se concentre sur les bordures.
-                  {isProcessing && ' Détection en cours...'}
+                  Cliquez au centre d'une case bien délimitée pour créer automatiquement une zone (l'algorithme détecte les bordures, ignore le texte).
                 </p>
               </div>
             )}
@@ -919,7 +723,6 @@ export default function DocumentEditor({ user, onBack, editingDocument }: Docume
                         onMouseDown={onDragStart}
                         onContextMenu={onContextMenu}
                         onResizeStart={onResizeStart}
-                        isActive={fillMode && zone.id === fillOrder[currentFillIndex]?.id}
                       />
                     ))}
                   </>
